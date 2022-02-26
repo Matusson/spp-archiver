@@ -1,5 +1,6 @@
 # Copyright 2022 Matusson
 # Released under MIT License
+# Version 1.0.0
 
 from PySide2 import QtWidgets as qw, QtCore
 import substance_painter.logging as lg
