@@ -1,16 +1,17 @@
-# Copyright 2022 Matusson
+# Copyright 2026 Matelemons
 # Released under MIT License
-# Version 1.0.0
+# Version 1.1.0
 
-from PySide2 import QtWidgets as qw, QtCore
+
 import substance_painter.logging as lg
 import substance_painter.project as pr
 import substance_painter.event as ev
 import substance_painter.textureset as ts
-import substance_painter.js as js
+import substance_painter.baking as bk
 import substance_painter.ui as ui
-import json
 import os
+
+from PySide6 import QtWidgets as qw, QtCore
 
 
 class ArchiverUI:
@@ -23,6 +24,8 @@ class ArchiverUI:
         self.left_button = qw.QPushButton()
         self.right_button = qw.QPushButton()
         self.autosaves_checkbox = qw.QCheckBox("Automatically delete autosaves")
+        self.modify_resolution_checkbox = qw.QCheckBox("Modify texture set resolution (128x128)")
+        self.modify_resolution_checkbox.setChecked(True)  # Default to checked
 
         # Initialize layouts
         main_layout = qw.QVBoxLayout()
@@ -33,6 +36,7 @@ class ArchiverUI:
 
         main_layout.addWidget(self.log)
         main_layout.addWidget(self.autosaves_checkbox)
+        main_layout.addWidget(self.modify_resolution_checkbox)
         main_layout.addLayout(button_layout)
         self.window.setLayout(main_layout)
 
@@ -45,6 +49,12 @@ class ArchiverUI:
         self.left_button.clicked.connect(self.left_clicked)
         self.right_button.clicked.connect(self.right_clicked)
         ev.DISPATCHER.connect(ev.ProjectEditionEntered, self.spp_loaded)
+        ev.DISPATCHER.connect(ev.BakingProcessEnded, self.baking_finished)
+
+        # Track texture sets to bake and saved parameters
+        self.texture_sets_to_bake = []
+        self.current_texture_set_index = 0
+        self.saved_parameters = {}
 
         self.send_ready_to_archive()
         self.update_buttons_text()
@@ -74,8 +84,7 @@ class ArchiverUI:
             for file in self.spp_files:
                 self.log.append(file)
 
-            self.log.append("These files will be affected. Please review and confirm."
-                            "\n*Painter might crash when done. This is normal and won't affect the outcome.")
+            self.log.append("These files will be affected. Please review and confirm.")
 
             if len(self.spp_files) > 10:
                 self.log.append("Archiving a lot of files can take a lof ot time!")
@@ -123,9 +132,6 @@ class ArchiverUI:
 
     def spp_load_next(self):
         # Check if reached the end
-        # This will inevitably crash when all files are processed, with no logs or messages or anything
-        # This seems to be related to opening and closing the files in the same stack trace?
-        # Can't confirm, couldn't fix in multiple hours, but it doesn't affect use.
         if self.current_file >= len(self.spp_files):
             self.reached_the_end()
             return
@@ -150,47 +156,128 @@ class ArchiverUI:
         pr.open(file)
 
     def spp_loaded(self, e):
-        if self.state is not 2:
+        if self.state != 2:
             return
 
         self.log.append("Loaded.")
         self.project_update_start()
 
     def project_update_start(self):
-        # Get and override the default baking parameters
-        baking_parameters = js.evaluate("alg.baking.commonBakingParameters()")
+        # Get all texture sets to bake
+        self.texture_sets_to_bake = ts.all_texture_sets()
+        self.current_texture_set_index = 0
+        self.saved_parameters = {}
 
-        # But save the original to restore later
-        orig_size = baking_parameters["commonParameters"]["Output_Size"]
-        orig_aa = baking_parameters["detailParameters"]["Antialiasing"]
+        if len(self.texture_sets_to_bake) == 0:
+            lg.log(lg.INFO, "SPP Archiver", "No texture sets to bake.")
+            self.project_update_finished()
+            return
 
-        baking_parameters["commonParameters"]["Output_Size"] = [1, 1]
-        baking_parameters["detailParameters"]["Antialiasing"] = "None"
+        # Unlink all common parameters so we can modify each texture set independently
+        bk.unlink_all_common_parameters()
+        lg.log(lg.INFO, "SPP Archiver", "Unlinked common parameters.")
 
-        js_set_code = "alg.baking.setCommonBakingParameters(JSON.parse('{0}'))".format(json.dumps(baking_parameters))
-        js.evaluate(js_set_code)
+        # Start baking the first texture set
+        self.bake_next_texture_set()
 
-        lg.log(lg.INFO, "SPP Archiver", "Updated baking parameters.")
+    def bake_next_texture_set(self):
+        if self.current_texture_set_index >= len(self.texture_sets_to_bake):
+            # All texture sets baked, restore settings
+            self.restore_all_settings()
+            lg.log(lg.INFO, "SPP Archiver", "All baking complete. Saving project...")
 
-        # Rebake all textures at very low resolution
-        all_texture_sets = ts.all_texture_sets()
-        for texset in all_texture_sets:
-            lg.log(lg.INFO, "SPP Archiver", "Baking " + texset.name())
+            # Use QTimer to delay save slightly so Painter isn't busy
+            QtCore.QTimer.singleShot(500, self.save_and_finish)
+            return
 
-            js_bake_code = "alg.baking.bake('{0}')".format(texset)
-            js.evaluate(js_bake_code)
+        texture_set = self.texture_sets_to_bake[self.current_texture_set_index]
+        lg.log(lg.INFO, "SPP Archiver", "Baking " + texture_set.name)
 
-        # Restore the settings
-        baking_parameters["commonParameters"]["Output_Size"] = orig_size
-        baking_parameters["detailParameters"]["Antialiasing"] = orig_aa
-        js_set_code = "alg.baking.setCommonBakingParameters(JSON.parse('{0}'))".format(json.dumps(baking_parameters))
-        js.evaluate(js_set_code)
+        # Get baking parameters for this texture set
+        baking_params = bk.BakingParameters.from_texture_set(texture_set)
+        common_params = baking_params.common()
 
-        # Saving the finished result
-        lg.log(lg.INFO, "SPP Archiver", "Finished baking, saving...")
-        pr.save(pr.ProjectSaveMode.Full)
+        # Save original values
+        output_size_prop = common_params.get("OutputSize")
+
+        if output_size_prop is not None:
+            # Save original baking parameters (texture set resolution changes are permanent)
+            self.saved_parameters[texture_set.name] = {
+                "output_size": output_size_prop.value(),
+                "enabled_bakers": baking_params.get_enabled_bakers(),
+                "textureset_enabled": baking_params.is_textureset_enabled()
+            }
+
+            # Enable the texture set for baking
+            baking_params.set_textureset_enabled(True)
+
+            # Enable all bakers (mesh maps) for this texture set
+            enabled_bakers = baking_params.get_enabled_bakers()
+            if not enabled_bakers:
+                # If no bakers enabled, enable common ones
+                baking_params.set_enabled_bakers([
+                    bk.MeshMapUsage.Normal,
+                    bk.MeshMapUsage.WorldSpaceNormal,
+                    bk.MeshMapUsage.ID,
+                    bk.MeshMapUsage.AO,
+                    bk.MeshMapUsage.Curvature,
+                    bk.MeshMapUsage.Position,
+                    bk.MeshMapUsage.Thickness
+                ])
+
+            # Set to low resolution
+            bk.BakingParameters.set({output_size_prop: (1, 1)})
+            lg.log(lg.INFO, "SPP Archiver", "Set baking resolution to 2x2 for " + texture_set.name)
+
+            # Modify texture set resolution if checkbox is checked
+            if self.modify_resolution_checkbox.isChecked():
+                texture_set.set_resolution(ts.Resolution(128, 128))
+                lg.log(lg.INFO, "SPP Archiver", "Set texture set resolution to 128x128 for " + texture_set.name)
+
+        # Start async baking
+        bk.bake_async(texture_set)
+
+    def save_and_finish(self):
+        try:
+            # Use Full mode to create the smallest possible file
+            pr.save(pr.ProjectSaveMode.Full)
+            lg.log(lg.INFO, "SPP Archiver", "Project saved successfully")
+        except Exception as e:
+            lg.log(lg.ERROR, "SPP Archiver", "Failed to save project: " + str(e))
 
         self.project_update_finished()
+
+    def baking_finished(self, event):
+        # Only process if we're in archiving state
+        if self.state != 2:
+            return
+
+        lg.log(lg.INFO, "SPP Archiver", "Baking completed for texture set.")
+
+        # Move to next texture set
+        self.current_texture_set_index += 1
+        self.bake_next_texture_set()
+
+    def restore_all_settings(self):
+        # Restore original baking settings for all texture sets
+        # Note: Texture set resolution changes are permanent and NOT restored
+        for texture_set in self.texture_sets_to_bake:
+            if texture_set.name in self.saved_parameters:
+                saved = self.saved_parameters[texture_set.name]
+                baking_params = bk.BakingParameters.from_texture_set(texture_set)
+                common_params = baking_params.common()
+
+                # Restore output size
+                output_size_prop = common_params.get("OutputSize")
+                if output_size_prop is not None:
+                    bk.BakingParameters.set({output_size_prop: saved["output_size"]})
+
+                # Restore enabled bakers and texture set state
+                baking_params.set_enabled_bakers(saved["enabled_bakers"])
+                baking_params.set_textureset_enabled(saved["textureset_enabled"])
+
+
+        lg.log(lg.INFO, "SPP Archiver", "Restored baking settings.")
 
     def project_update_finished(self):
         # In case of current-project-only archiving
@@ -220,6 +307,7 @@ class ArchiverUI:
         message = "This tool re-bakes all mesh maps to just 2x2 resolution to save storage. " \
                   "You can always re-bake when necesary, " \
                   "however this can be a long process, so please use this tool cautiously.\n" \
+                  "In addition, the tool can further reduce storage by (permanently) changing texture set resolution and removing autosaves.\n" \
                   "You can either archive all .spp files in a directory (and child directories), or just the " \
                   "currently open project.\nPlease select the appropriate option."
         self.log.append(message)
